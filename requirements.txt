@@ -16,3 +16,7 @@ pillow
 python-dotenv
 xai_sdk
 pdf2image
+anthropic
+PyYAML
+networkx
+graphviz
