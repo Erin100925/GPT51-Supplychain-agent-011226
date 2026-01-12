@@ -2,7 +2,7 @@ import os
 import json
 import re
 import random
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import streamlit as st
 import yaml
@@ -136,7 +136,7 @@ UI_TEXT = {
         "apply_refinement": "Apply refined fragment to plan",
         "nodes_label": "Nodes are work items; arrows show dependencies.",
 
-        # New – supply chain tab
+        # Supply chain tab
         "supply_tab": "Medical Supply Chain",
         "supply_intro": "Upload, preview, modify and analyze medical device tracking records (supplier packing list & hospital incoming list).",
         "supplier_dataset": "Supplier Packing List",
@@ -172,6 +172,15 @@ UI_TEXT = {
         "data_agent_select": "Select agent",
         "data_agent_run": "Run selected agent on datasets",
         "data_prompt_with_context": "Additional instructions / focus for this run",
+
+        # New – standardization feature
+        "standardize_supplier": "Standardize supplier dataset to canonical schema",
+        "standardize_hospital": "Standardize hospital dataset to canonical schema",
+        "standardization_done": "Dataset has been transformed to the standardized schema.",
+        "download_format": "Download format",
+        "view_mapping": "Show column mapping (raw → standard)",
+        "mapping_supplier": "Supplier column mapping",
+        "mapping_hospital": "Hospital column mapping",
     },
     LANG_ZH: {
         "title": "智慧代理專案協調器",
@@ -223,7 +232,7 @@ UI_TEXT = {
         "apply_refinement": "套用優化片段至計畫",
         "nodes_label": "節點為工作項目，箭頭為相依關係。",
 
-        # New – supply chain tab
+        # Supply chain tab
         "supply_tab": "醫療器材供應鏈",
         "supply_intro": "上傳、預覽、修改與分析醫療器材追蹤紀錄（供應商裝箱單與醫院入庫清單）。",
         "supplier_dataset": "供應商裝箱單",
@@ -259,6 +268,15 @@ UI_TEXT = {
         "data_agent_select": "選擇代理",
         "data_agent_run": "在資料集上執行所選代理",
         "data_prompt_with_context": "本次執行的額外說明 / 聚焦重點",
+
+        # New – standardization feature
+        "standardize_supplier": "將供應商資料轉換為標準欄位結構",
+        "standardize_hospital": "將醫院資料轉換為標準欄位結構",
+        "standardization_done": "資料已轉換為標準欄位結構。",
+        "download_format": "下載格式",
+        "view_mapping": "顯示欄位對應（原始 → 標準）",
+        "mapping_supplier": "供應商欄位對應表",
+        "mapping_hospital": "醫院欄位對應表",
     },
 }
 
@@ -415,6 +433,135 @@ def create_mock_hospital_df() -> pd.DataFrame:
 
 
 # -------------------------------------------
+# Standard schemas & heuristic mapping
+# -------------------------------------------
+
+STANDARD_SUPPLIER_COLS = [
+    "shipment_id",
+    "supplier_name",
+    "hospital_code",
+    "hospital_name",
+    "device_id",
+    "device_name",
+    "lot_number",
+    "expiry_date",
+    "ship_date",
+    "quantity",
+    "uom",
+    "po_number",
+]
+
+STANDARD_HOSPITAL_COLS = [
+    "receipt_id",
+    "linked_shipment_id",
+    "hospital_code",
+    "hospital_name",
+    "device_id",
+    "device_name",
+    "lot_number",
+    "expiry_date",
+    "received_date",
+    "quantity",
+    "status",
+]
+
+SUPPLIER_SYNONYMS = {
+    "shipment_id": ["shipment", "shipid", "ship_no", "shipmentno", "shipmentnumber"],
+    "supplier_name": ["supplier", "vendor", "manufacturer"],
+    "hospital_code": ["hospitalcode", "hospcode", "facilitycode"],
+    "hospital_name": ["hospital", "facility", "customer"],
+    "device_id": ["deviceid", "productid", "itemcode", "catno"],
+    "device_name": ["devicename", "productname", "itemname", "description"],
+    "lot_number": ["lot", "lotno", "lotnumber", "batch", "batchno"],
+    "expiry_date": ["expiry", "expiration", "expdate", "expiredate"],
+    "ship_date": ["shipdate", "shipmentdate", "dispatched", "sentdate"],
+    "quantity": ["qty", "quantity", "amount", "units"],
+    "uom": ["uom", "unit", "unitofmeasure"],
+    "po_number": ["po", "pono", "ponumber", "purchaseorder"],
+}
+
+HOSPITAL_SYNONYMS = {
+    "receipt_id": ["receiptid", "grn", "grnno", "receiptnumber"],
+    "linked_shipment_id": ["shipment", "shipmentid", "shipid", "referencesshipment"],
+    "hospital_code": ["hospitalcode", "hospcode", "facilitycode"],
+    "hospital_name": ["hospital", "facility", "customer"],
+    "device_id": ["deviceid", "productid", "itemcode", "catno"],
+    "device_name": ["devicename", "productname", "itemname", "description"],
+    "lot_number": ["lot", "lotno", "lotnumber", "batch", "batchno"],
+    "expiry_date": ["expiry", "expiration", "expdate", "expiredate"],
+    "received_date": ["receiveddate", "grndate", "receiptdate", "received_on"],
+    "quantity": ["qty", "quantity", "amount", "units"],
+    "status": ["status", "state", "result"],
+}
+
+
+def _normalize_col_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _build_mapping(
+    raw_df: pd.DataFrame,
+    standard_cols: List[str],
+    synonyms: Dict[str, List[str]],
+) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
+    raw_cols = list(raw_df.columns)
+    norm_map = {_normalize_col_name(c): c for c in raw_cols}
+
+    mapping_info: List[Dict[str, str]] = []
+    mapped_cols: Dict[str, Optional[str]] = {}
+
+    for std in standard_cols:
+        std_norm = _normalize_col_name(std)
+        matched: Optional[str] = None
+        match_type = "none"
+
+        # 1) exact normalized name
+        if std_norm in norm_map:
+            matched = norm_map[std_norm]
+            match_type = "exact_name"
+        else:
+            # 2) synonym substring match
+            for raw in raw_cols:
+                rn = _normalize_col_name(raw)
+                for alias in synonyms.get(std, []):
+                    alias_norm = _normalize_col_name(alias)
+                    if alias_norm and alias_norm in rn:
+                        matched = raw
+                        match_type = f"alias:{alias}"
+                        break
+                if matched:
+                    break
+
+        mapped_cols[std] = matched
+        mapping_info.append(
+            {
+                "standard_column": std,
+                "matched_raw_column": matched or "",
+                "match_type": match_type,
+            }
+        )
+
+    # build standardized df
+    std_df = pd.DataFrame()
+    for std in standard_cols:
+        src = mapped_cols[std]
+        if src is not None and src in raw_df.columns:
+            std_df[std] = raw_df[src]
+        else:
+            std_df[std] = pd.NA
+
+    return std_df, mapping_info
+
+
+def standardize_supplier_df(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
+    return _build_mapping(raw_df, STANDARD_SUPPLIER_COLS, SUPPLIER_SYNONYMS)
+
+
+def standardize_hospital_df(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
+    return _build_mapping(raw_df, STANDARD_HOSPITAL_COLS, HOSPITAL_SYNONYMS)
+
+
+# -------------------------------------------
 # Session State Initialization & Theme / Lang
 # -------------------------------------------
 
@@ -451,11 +598,15 @@ def init_session_state():
             "system_prompt": "",
         }
 
-    # New: datasets & analysis state
+    # datasets & analysis state
     if "supplier_df" not in st.session_state:
         st.session_state["supplier_df"] = create_mock_supplier_df()
     if "hospital_df" not in st.session_state:
         st.session_state["hospital_df"] = create_mock_hospital_df()
+    if "supplier_mapping_info" not in st.session_state:
+        st.session_state["supplier_mapping_info"] = []
+    if "hospital_mapping_info" not in st.session_state:
+        st.session_state["hospital_mapping_info"] = []
     if "supply_summary_md" not in st.session_state:
         st.session_state["supply_summary_md"] = ""
     if "data_chat_output" not in st.session_state:
@@ -836,7 +987,6 @@ def render_wow_status():
 
 
 def render_supply_wow_status():
-    """Additional WOW metrics for the medical supply chain."""
     ui = get_ui_text()
     supplier_df: pd.DataFrame = st.session_state["supplier_df"]
     hospital_df: pd.DataFrame = st.session_state["hospital_df"]
@@ -1089,7 +1239,6 @@ def render_agents_tab():
                         btn_key = f"run_{aid}_{wi.get('id')}"
                         if st.button(ui["run_agent"], key=btn_key):
                             try:
-                                # Allow override by orchestrator settings if agent.model not set
                                 model = agent.get("model") or st.session_state[
                                     "orchestrator_settings"
                                 ]["model"]
@@ -1268,7 +1417,7 @@ def run_orchestrator_ui():
 # Supply chain – helpers
 # -------------------------
 
-def load_uploaded_df(file) -> pd.DataFrame:
+def load_uploaded_df(file) -> Optional[pd.DataFrame]:
     if file is None:
         return None
     name = file.name.lower()
@@ -1279,7 +1428,6 @@ def load_uploaded_df(file) -> pd.DataFrame:
             data = json.load(file)
             return pd.DataFrame(data)
         else:
-            # try CSV first, then JSON
             try:
                 file.seek(0)
                 return pd.read_csv(file)
@@ -1298,7 +1446,6 @@ def build_supply_chain_graph(
     min_quantity: float = 0.0,
     device_filter: Optional[List[str]] = None,
 ) -> Optional[go.Figure]:
-    # require at least supplier_name and hospital_name from supplier_df
     if "supplier_name" not in supplier_df.columns:
         return None
     if "hospital_name" not in supplier_df.columns and "hospital_name" not in hospital_df.columns:
@@ -1309,7 +1456,6 @@ def build_supply_chain_graph(
         if "device_id" in df_sup.columns:
             df_sup = df_sup[df_sup["device_id"].isin(device_filter)]
 
-    # quantity aggregation
     qty_col = "quantity" if "quantity" in df_sup.columns else None
     if qty_col:
         grp = (
@@ -1375,9 +1521,9 @@ def build_supply_chain_graph(
         node_y.append(y)
         typ = data.get("type", "other")
         if typ == "supplier":
-            node_color.append("#0ea5e9")  # blue
+            node_color.append("#0ea5e9")
         elif typ == "hospital":
-            node_color.append("#22c55e")  # green
+            node_color.append("#22c55e")
         else:
             node_color.append("#e5e7eb")
         total_weight = sum(
@@ -1435,7 +1581,6 @@ def render_supply_chain_tab():
     supplier_df: pd.DataFrame = st.session_state["supplier_df"]
     hospital_df: pd.DataFrame = st.session_state["hospital_df"]
 
-    # WOW metrics for supply chain
     render_supply_wow_status()
 
     st.markdown("---")
@@ -1452,11 +1597,20 @@ def render_supply_chain_tab():
             key="upload_supplier",
         )
         if uploaded_sup is not None:
-            df = load_uploaded_df(uploaded_sup)
-            if df is not None:
-                st.session_state["supplier_df"] = df
-                supplier_df = df
-                st.success("Supplier dataset loaded.")
+            raw_df = load_uploaded_df(uploaded_sup)
+            if raw_df is not None:
+                std_df, mapping_info = standardize_supplier_df(raw_df)
+                st.session_state["supplier_df"] = std_df
+                st.session_state["supplier_mapping_info"] = mapping_info
+                supplier_df = std_df
+                st.success(ui["standardization_done"])
+
+        if st.button(ui["standardize_supplier"], key="btn_standardize_supplier"):
+            std_df, mapping_info = standardize_supplier_df(st.session_state["supplier_df"])
+            st.session_state["supplier_df"] = std_df
+            st.session_state["supplier_mapping_info"] = mapping_info
+            supplier_df = std_df
+            st.success(ui["standardization_done"])
 
         supplier_df = st.data_editor(
             supplier_df,
@@ -1466,29 +1620,42 @@ def render_supply_chain_tab():
         )
         st.session_state["supplier_df"] = supplier_df
 
+        if st.session_state["supplier_mapping_info"]:
+            with st.expander(f"{ui['mapping_supplier']} ({ui['view_mapping']})"):
+                mapping_df = pd.DataFrame(st.session_state["supplier_mapping_info"])
+                st.dataframe(mapping_df, hide_index=True, use_container_width=True)
+
         sup_csv = supplier_df.to_csv(index=False).encode("utf-8")
         sup_json = json.dumps(
             supplier_df.to_dict(orient="records"), ensure_ascii=False, indent=2
         ).encode("utf-8")
 
-        c1, c2, c3 = st.columns([2, 2, 1])
+        c1, c2, c3 = st.columns([2, 2, 2])
         with c1:
-            st.download_button(
-                ui["download_supplier_csv"],
-                data=sup_csv,
-                file_name="supplier_packing_list.csv",
-                mime="text/csv",
+            fmt = st.selectbox(
+                ui["download_format"],
+                options=["CSV", "JSON"],
+                key="supplier_download_format",
             )
         with c2:
-            st.download_button(
-                ui["download_supplier_json"],
-                data=sup_json,
-                file_name="supplier_packing_list.json",
-                mime="application/json",
-            )
+            if fmt == "CSV":
+                st.download_button(
+                    ui["download_supplier_csv"],
+                    data=sup_csv,
+                    file_name="supplier_packing_list.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.download_button(
+                    ui["download_supplier_json"],
+                    data=sup_json,
+                    file_name="supplier_packing_list.json",
+                    mime="application/json",
+                )
         with c3:
             if st.button(ui["reset_to_mock"], key="reset_supplier"):
                 st.session_state["supplier_df"] = create_mock_supplier_df()
+                st.session_state["supplier_mapping_info"] = []
                 st.experimental_rerun()
 
     # Hospital dataset
@@ -1500,11 +1667,20 @@ def render_supply_chain_tab():
             key="upload_hospital",
         )
         if uploaded_hosp is not None:
-            df = load_uploaded_df(uploaded_hosp)
-            if df is not None:
-                st.session_state["hospital_df"] = df
-                hospital_df = df
-                st.success("Hospital dataset loaded.")
+            raw_df = load_uploaded_df(uploaded_hosp)
+            if raw_df is not None:
+                std_df, mapping_info = standardize_hospital_df(raw_df)
+                st.session_state["hospital_df"] = std_df
+                st.session_state["hospital_mapping_info"] = mapping_info
+                hospital_df = std_df
+                st.success(ui["standardization_done"])
+
+        if st.button(ui["standardize_hospital"], key="btn_standardize_hospital"):
+            std_df, mapping_info = standardize_hospital_df(st.session_state["hospital_df"])
+            st.session_state["hospital_df"] = std_df
+            st.session_state["hospital_mapping_info"] = mapping_info
+            hospital_df = std_df
+            st.success(ui["standardization_done"])
 
         hospital_df = st.data_editor(
             hospital_df,
@@ -1514,34 +1690,47 @@ def render_supply_chain_tab():
         )
         st.session_state["hospital_df"] = hospital_df
 
+        if st.session_state["hospital_mapping_info"]:
+            with st.expander(f"{ui['mapping_hospital']} ({ui['view_mapping']})"):
+                mapping_df = pd.DataFrame(st.session_state["hospital_mapping_info"])
+                st.dataframe(mapping_df, hide_index=True, use_container_width=True)
+
         hosp_csv = hospital_df.to_csv(index=False).encode("utf-8")
         hosp_json = json.dumps(
             hospital_df.to_dict(orient="records"), ensure_ascii=False, indent=2
         ).encode("utf-8")
 
-        c1, c2, c3 = st.columns([2, 2, 1])
+        c1, c2, c3 = st.columns([2, 2, 2])
         with c1:
-            st.download_button(
-                ui["download_hospital_csv"],
-                data=hosp_csv,
-                file_name="hospital_incoming_list.csv",
-                mime="text/csv",
+            fmt = st.selectbox(
+                ui["download_format"],
+                options=["CSV", "JSON"],
+                key="hospital_download_format",
             )
         with c2:
-            st.download_button(
-                ui["download_hospital_json"],
-                data=hosp_json,
-                file_name="hospital_incoming_list.json",
-                mime="application/json",
-            )
+            if fmt == "CSV":
+                st.download_button(
+                    ui["download_hospital_csv"],
+                    data=hosp_csv,
+                    file_name="hospital_incoming_list.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.download_button(
+                    ui["download_hospital_json"],
+                    data=hosp_json,
+                    file_name="hospital_incoming_list.json",
+                    mime="application/json",
+                )
         with c3:
             if st.button(ui["reset_to_mock"], key="reset_hospital"):
                 st.session_state["hospital_df"] = create_mock_hospital_df()
+                st.session_state["hospital_mapping_info"] = []
                 st.experimental_rerun()
 
     st.markdown("---")
 
-    # Summary section
+    # Summary section and the rest (unchanged logic, still uses standardized dfs)
     st.markdown(f"### {ui['supply_summary_section']}")
     st.caption(ui["summary_words_hint"])
 
@@ -1607,7 +1796,6 @@ def render_supply_chain_tab():
 
     if st.button(ui["summary_run"]):
         try:
-            # Serialize datasets; keep reasonable size by truncating if huge
             supplier_csv = st.session_state["supplier_df"].to_csv(index=False)
             hospital_csv = st.session_state["hospital_df"].to_csv(index=False)
 
@@ -1649,7 +1837,6 @@ def render_supply_chain_tab():
             height=420,
         )
         st.session_state["supply_summary_md"] = edited
-        # Render as markdown preview
         st.markdown("---")
         view_mode = st.radio(
             ui["agent_result_view"],
@@ -1668,7 +1855,6 @@ def render_supply_chain_tab():
     st.markdown(f"### {ui['graph_section']}")
     st.caption(ui["graph_hint"])
 
-    # Filters
     col_f1, col_f2 = st.columns([1, 2])
     with col_f1:
         min_ship = st.number_input(
@@ -2032,7 +2218,6 @@ def main():
         ]
     )
 
-    # Project dashboard
     with tabs[0]:
         run_orchestrator_ui()
         plan = st.session_state["project_plan"]
@@ -2052,19 +2237,15 @@ def main():
             with col4:
                 render_dependency_graph(plan)
 
-    # Medical supply chain tab
     with tabs[1]:
         render_supply_chain_tab()
 
-    # Agents & execution tab
     with tabs[2]:
         render_agents_tab()
 
-    # Refinement / prompt on plan
     with tabs[3]:
         render_refinement_tab()
 
-    # Skills
     with tabs[4]:
         st.subheader(ui["skills_tab"])
         skills = st.session_state["skills"]
@@ -2079,7 +2260,6 @@ def main():
                     if s.get("raw"):
                         st.code(s["raw"], language="markdown")
 
-    # Config / API keys
     with tabs[5]:
         render_api_key_section()
         st.markdown("---")
